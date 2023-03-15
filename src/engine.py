@@ -9,43 +9,55 @@ import json
 from tqdm import tqdm
 device = 'cpu'
 
+DATA_CSV_PATH = "/home/pd/datasets/yelp_reviews/yelp_reviews_2048.csv"
+DATA_PATH = "/home/pd/datasets/yelp_reviews/yelp_reviews.json"
+SUMMARY_PATH = '/home/pd/summaries/yelp_summary_13Mar23.txt'
+OUTPUT_MODEL_PATH = '/home/pd/models/yelp_sentiment.bin'
+OUTPUT_VOCAB_PATH = '/home/pd/models/yelp_sentiment_vocab.bin'
+
+FROM_CSV_CONDENSED = True #otherwise getting from full json file
+
 #read-in data
 lowstar_review_limit = 1024
 review_limit = np.inf
 sample_per_cat = 1024
 max_num_words = 50
 
+rev = pd.DataFrame()
+if FROM_CSV_CONDENSED:
+    path = DATA_PATH
+    review_fields_wanted = ['text','lowstar']
+    rev = pd.DataFrame(columns=review_fields_wanted)
+    with open(path,encoding='utf-8') as d:
+        counter = 0
+        lowstar_counter = 0
+        for line in d:
+            L = json.loads(line)
+            lowstar = L['stars'] == 1 or (L['stars'] == 2)
+            fivestar = L['stars'] == 5
+            not1or5 = not(lowstar or fivestar)
+            if len(L['text'].split()) > max_num_words or not1or5:
+                continue
+            if lowstar:
+                lowstar_counter += 1
+                L['lowstar'] = 1
+            else:
+                L['lowstar'] = 0
+            less_fields = {key: L[key] for key in review_fields_wanted }
+            rev.loc[counter] = less_fields
+            counter += 1
+            if counter == review_limit or lowstar_counter == lowstar_review_limit:
+                break
 
-path = "/home/pd/datasets/yelp_reviews/yelp_reviews.json"
-review_fields_wanted = ['text','lowstar']
-rev = pd.DataFrame(columns=review_fields_wanted)
-with open(path,encoding='utf-8') as d:
-    counter = 0
-    lowstar_counter = 0
-    for line in d:
-        L = json.loads(line)
-        lowstar = L['stars'] == 1 or (L['stars'] == 2)
-        fivestar = L['stars'] == 5
-        not1or5 = not(lowstar or fivestar)
-        if len(L['text'].split()) > max_num_words or not1or5:
-            continue
-        if lowstar:
-            lowstar_counter += 1
-            L['lowstar'] = 1
-        else:
-            L['lowstar'] = 0
-        less_fields = {key: L[key] for key in review_fields_wanted }
-        rev.loc[counter] = less_fields
-        counter += 1
-        if counter == review_limit or lowstar_counter == lowstar_review_limit:
-            break
-
-            
-rev = rev.rename(columns = {'text':'_text','lowstar':'_lowstar'})
+                
+    rev = rev.rename(columns = {'text':'_text','lowstar':'_lowstar'})
 
 
-rev = rev.groupby('_lowstar').apply(lambda x: x.sample(sample_per_cat)).reset_index(drop=True)
-rev['TARGETS'] = rev['_lowstar']
+    rev = rev.groupby('_lowstar').apply(lambda x: x.sample(sample_per_cat)).reset_index(drop=True)
+    rev['TARGETS'] = rev['_lowstar']
+else:
+    rev = pd.read_csv(DATA_CSV_PATH)
+
 print(f'Number of 1 star reviews:{rev._lowstar[rev._lowstar == 1].count()}')
 print(f'Number of 5 star reviews:{rev._lowstar[rev._lowstar == 0].count()}')
 print(rev._text[rev._lowstar == 1].sample(5))
@@ -242,8 +254,7 @@ def valid(model, testing_loader):
             #print individual wrong responses to file
             if VALID_BATCH_SIZE == 1 and wrong_outputs < max_wrong_outputs: 
                 wrong_outputs += 1
-                path = '/home/pd/summaries/yelp_summary_13Mar23.txt'
-                with open(path,'a') as f:
+                with open(SUMMARY_PATH,'a') as f:
                     f.write(DBDetokenize(data))
                     f.write(f'Should be: {1 if targets.item() else 5}')
                     f.write('\n')
@@ -267,9 +278,6 @@ def valid(model, testing_loader):
 acc = valid(model, testing_loader)
 print("Accuracy on test data = %0.2f%%" % acc)
 
-output_model_file = '/home/pd/models/yelp_sentiment.bin'
-output_vocab_file = '/home/pd/models/yelp_sentiment_vocab.bin'
-
 model_to_save = model
-torch.save(model_to_save, output_model_file)
-tokenizer.save_vocabulary(output_vocab_file)
+torch.save(model_to_save, OUTPUT_MODEL_PATH)
+tokenizer.save_vocabulary(OUTPUT_VOCAB_PATH)
