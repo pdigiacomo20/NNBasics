@@ -7,6 +7,7 @@ import torch
 import numpy as np
 import json
 from tqdm import tqdm
+import pickle
 device = 'cpu'
 
 DATA_CSV_PATH = "/home/pd/datasets/yelp_reviews/yelp_reviews_2048.csv"
@@ -14,6 +15,12 @@ DATA_PATH = "/home/pd/datasets/yelp_reviews/yelp_reviews.json"
 SUMMARY_PATH = '/home/pd/summaries/yelp_summary_13Mar23.txt'
 OUTPUT_MODEL_PATH = '/home/pd/models/yelp_sentiment.bin'
 OUTPUT_VOCAB_PATH = '/home/pd/models/yelp_sentiment_vocab.bin'
+BERT_OUT_PATH = '/home/pd/datasets/yelp_reviews/yelp_reviews_postBERT_1024.pt'
+TARG_OUT_PATH = '/home/pd/datasets/yelp_reviews/yelp_reviews_targets_1024.pt'
+
+
+SAVE_BERT_LAYER_OUT = True
+FROM_BERT_LAYER_OUT = not SAVE_BERT_LAYER_OUT
 
 FROM_CSV_CONDENSED = True #otherwise getting from full json file
 
@@ -23,6 +30,117 @@ review_limit = np.inf
 sample_per_cat = 1024
 max_num_words = 50
 
+#init train/test params
+MAX_LEN = 64
+TRAIN_BATCH_SIZE = 64
+VALID_BATCH_SIZE = 1 #set to 1 for printing of individual wrong predictions
+EPOCHS = 10
+LEARNING_RATE = 1e-05
+AUTO_SCALE_GRAD = False
+
+#def dataset
+class DFToTokenized(Dataset):
+    def __init__(self,df,tokenizer,max_len):
+        self.len = len(df)
+        self.data = df
+        self.tokenizer = tokenizer
+        self.max_len = max_len
+
+    def __getitem__(self,index):
+
+        review = ' '.join(self.data['_text'][index].split())
+        inp = self.tokenizer.encode_plus(
+            review,
+            None,
+            add_special_tokens=True,
+            max_length=self.max_len,
+            pad_to_max_length=True,
+            return_token_type_ids=True,
+            truncation=True
+        )
+        tokens = inp['input_ids']
+        mask = inp['attention_mask']
+
+        return {
+            'ids': torch.tensor(tokens, dtype=torch.long),
+            'mask': torch.tensor(mask, dtype=torch.long),
+            'targets': torch.tensor(self.data.TARGETS[index], dtype=torch.uint8)
+        } 
+
+    def __len__(self):
+        return self.len
+
+#def dataset
+class EncoderOutput(Dataset):
+    def __init__(self,input_t, targets_t):
+        self.len = input_t.shape[0]
+        assert self.len == targets_t.shape[0]
+        self.inputs = input_t
+        self.targets = targets_t
+
+    def __getitem__(self,index):
+        return {'inputs': self.inputs[index,:],'targets':self.targets[index,:]}
+
+    def __len__(self):
+        return self.len
+
+
+#def model
+class DBertMultiCat(torch.nn.Module):
+    def __init__(self):
+        super(DBertMultiCat, self).__init__()
+        self.l1 = DistilBertModel.from_pretrained("distilbert-base-uncased")
+        self.pre_classifier = torch.nn.Linear(768, 768)
+        self.dropout = torch.nn.Dropout(0.3)
+        self.classifier = torch.nn.Linear(768, 2)
+
+    def forward(self, input_ids, attention_mask):
+        output_1 = self.l1(input_ids=input_ids, attention_mask=attention_mask)
+        hidden_state = output_1[0]
+        pooler = hidden_state[:, 0]
+        pooler = self.pre_classifier(pooler)
+        pooler = torch.nn.ReLU()(pooler)
+        pooler = self.dropout(pooler)
+        output = self.classifier(pooler)
+        return output
+
+#def model (post bert)
+class DecodeMultiCat(torch.nn.Module):
+    def __init__(self):
+        super(DecodeMultiCat, self).__init__()
+        self.pre_classifier = torch.nn.Linear(768, 768)
+        self.dropout = torch.nn.Dropout(0.3)
+        self.classifier = torch.nn.Linear(768, 2)
+
+    def forward(self, input_t):
+        # print(input_t.dtype)
+        # print(list(map(lambda x: x.dtype , self.pre_classifier.parameters())))
+        pooler = self.pre_classifier(input_t)
+        pooler = torch.nn.ReLU()(pooler)
+        pooler = self.dropout(pooler)
+        output = self.classifier(pooler)
+        return output
+
+if FROM_BERT_LAYER_OUT:
+    #INIT model, loss, optimizer
+    model = DecodeMultiCat()
+    for p in model.parameters():
+        p.requires_grad = True
+else:
+    #INIT model, loss, optimizer
+    model = DBertMultiCat()
+    for p in model.l1.parameters():
+        p.requires_grad = False
+
+model.to(device)
+loss_function = torch.nn.CrossEntropyLoss()
+params_with_grad = filter(lambda p: p.requires_grad, model.parameters())
+optimizer = torch.optim.Adam(params =  params_with_grad, lr=LEARNING_RATE)
+if AUTO_SCALE_GRAD:
+    scaler = torch.cuda.amp.GradScaler()
+
+
+#read in data
 rev = pd.DataFrame()
 if FROM_CSV_CONDENSED:
     path = DATA_PATH
@@ -63,55 +181,22 @@ print(f'Number of 5 star reviews:{rev._lowstar[rev._lowstar == 0].count()}')
 print(rev._text[rev._lowstar == 1].sample(5))
 print(rev._text[rev._lowstar == 0].sample(5))
 
-
-#def dataset
-class DFToTokenized(Dataset):
-    def __init__(self,df,tokenizer,max_len):
-        self.len = len(df)
-        self.data = df
-        self.tokenizer = tokenizer
-        self.max_len = max_len
-
-    def __getitem__(self,index):
-
-        review = ' '.join(self.data['_text'][index].split())
-        inp = self.tokenizer.encode_plus(
-            review,
-            None,
-            add_special_tokens=True,
-            max_length=self.max_len,
-            pad_to_max_length=True,
-            return_token_type_ids=True,
-            truncation=True
-        )
-        tokens = inp['input_ids']
-        mask = inp['attention_mask']
-
-        return {
-            'ids': torch.tensor(tokens, dtype=torch.long),
-            'mask': torch.tensor(mask, dtype=torch.long),
-            'targets': torch.tensor(self.data.TARGETS[index], dtype=torch.uint8)
-        } 
-
-    def __len__(self):
-        return self.len
-
-#init train/test params
-MAX_LEN = 64
-TRAIN_BATCH_SIZE = 64
-VALID_BATCH_SIZE = 1 #set to 1 for printing of individual wrong predictions
-EPOCHS = 10
-LEARNING_RATE = 1e-05
-AUTO_SCALE_GRAD = False
 tokenizer = DistilBertTokenizer.from_pretrained('distilbert-base-cased')
-
 train_frac = 0.8
-train_dataset=rev.sample(frac=train_frac,random_state=200)
-test_dataset=rev.drop(train_dataset.index).reset_index(drop=True)
-train_dataset = train_dataset.reset_index(drop=True)
 
-training_set = DFToTokenized(train_dataset, tokenizer, MAX_LEN)
-testing_set = DFToTokenized(test_dataset, tokenizer, MAX_LEN)
+if FROM_BERT_LAYER_OUT:
+    bert_out = torch.load(BERT_OUT_PATH)
+    targ_out = torch.load(TARG_OUT_PATH)
+    start_test = int(bert_out.shape[0]*train_frac)
+    training_set = EncoderOutput(bert_out[:start_test,:],targ_out[:start_test,:])
+    testing_set = EncoderOutput(bert_out[start_test:,:],targ_out[start_test:,:])
+else:
+    train_dataset=rev.sample(frac=train_frac,random_state=200)
+    test_dataset=rev.drop(train_dataset.index).reset_index(drop=True)
+    train_dataset = train_dataset.reset_index(drop=True)
+
+    training_set = DFToTokenized(train_dataset, tokenizer, MAX_LEN)
+    testing_set = DFToTokenized(test_dataset, tokenizer, MAX_LEN)
 
 train_params = {'batch_size': TRAIN_BATCH_SIZE,
                 'shuffle': True,
@@ -133,36 +218,27 @@ testing_loader = DataLoader(testing_set, **test_params)
 
 single_loader = DataLoader(training_set,**single_params)
 
-#def model
-class DBertMultiCat(torch.nn.Module):
-    def __init__(self):
-        super(DBertMultiCat, self).__init__()
-        self.l1 = DistilBertModel.from_pretrained("distilbert-base-uncased")
-        self.pre_classifier = torch.nn.Linear(768, 768)
-        self.dropout = torch.nn.Dropout(0.3)
-        self.classifier = torch.nn.Linear(768, 2)
+bert_out_t = None
+outputs_here = None
+targets_t = None
+if SAVE_BERT_LAYER_OUT:
+    for _,data in enumerate(single_loader, 0):
 
-    def forward(self, input_ids, attention_mask):
-        output_1 = self.l1(input_ids=input_ids, attention_mask=attention_mask)
-        hidden_state = output_1[0]
-        pooler = hidden_state[:, 0]
-        pooler = self.pre_classifier(pooler)
-        pooler = torch.nn.ReLU()(pooler)
-        pooler = self.dropout(pooler)
-        output = self.classifier(pooler)
-        return output
+        ids = data['ids'].to(device, dtype = torch.long)
+        mask = data['mask'].to(device, dtype = torch.long)
+        targets = data['targets'].to(device, dtype = torch.uint8)
 
+        outputs_here = model.l1(ids, mask)[0][:,0]
+        if bert_out_t == None:
+            bert_out_t = outputs_here
+            targets_t = targets
+        else:
+            bert_out_t = torch.cat((bert_out_t,outputs_here),0)
+            targets_t = torch.cat((targets_t,targets),0)
+    torch.save(bert_out_t,BERT_OUT_PATH)
+    torch.save(targets_t.unsqueeze(1),TARG_OUT_PATH)
 
-#INIT model, loss, optimizer
-model = DBertMultiCat()
-for p in model.l1.parameters():
-    p.requires_grad = False
-model.to(device)
-loss_function = torch.nn.CrossEntropyLoss()
-params_with_grad = filter(lambda p: p.requires_grad, model.parameters())
-optimizer = torch.optim.Adam(params =  params_with_grad, lr=LEARNING_RATE)
-if AUTO_SCALE_GRAD:
-    scaler = torch.cuda.amp.GradScaler()
+        
 
 #train loop def
 def calcuate_accu(big_idx, targets):
@@ -181,7 +257,10 @@ def train(epoch):
         ids = data['ids'].to(device, dtype = torch.long)
         mask = data['mask'].to(device, dtype = torch.long)
         targets = data['targets'].to(device, dtype = torch.uint8)
-
+        print('targ shape')
+        print(targets.shape)
+        print(outputs.shape)
+        quit()
         if AUTO_SCALE_GRAD:
             with torch.cpu.amp.autocast():
                 outputs = model(ids, mask)
@@ -221,10 +300,65 @@ def train(epoch):
 
     return 
 
+def train_decode(epoch):
+    tr_loss = 0
+    n_correct = 0
+    nb_tr_steps = 0
+    nb_tr_examples = 0
+    model.train()
+    for _,data in tqdm(enumerate(training_loader, 0),total=len(training_loader),
+        position=0, leave=True):
+        inputs = data['inputs'].to(device, dtype = torch.long)
+        targets = data['targets'].to(device, dtype = torch.long)
+        if AUTO_SCALE_GRAD:
+            with torch.cpu.amp.autocast():
+                outputs = model(inputs)
+                loss = loss_function(outputs, targets)
+        else:
+            inputs = inputs.type(torch.float)
+            outputs = model(inputs)
+            
+            loss = loss_function(outputs, targets)
+        tr_loss += loss.item()
+        big_val, big_idx = torch.max(outputs.data, dim=1)
+        n_correct += calcuate_accu(big_idx, targets)
+
+        nb_tr_steps += 1
+        nb_tr_examples+=targets.size(0)
+        
+        if _%5000==0:
+            loss_step = tr_loss/nb_tr_steps
+            accu_step = (n_correct*100)/nb_tr_examples 
+            print(f"Training Loss per 5000 steps: {loss_step}")
+            print(f"Training Accuracy per 5000 steps: {accu_step}")
+
+
+        optimizer.zero_grad(set_to_none=True)
+        if(AUTO_SCALE_GRAD):
+            scaler.scale(loss).backward()
+            # # When using GPU
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            optimizer.step()
+
+    print(f'The Total Accuracy for Epoch {epoch}: {(n_correct*100)/nb_tr_examples}')
+    epoch_loss = tr_loss/nb_tr_steps
+    epoch_accu = (n_correct*100)/nb_tr_examples
+    print(f"Training Loss Epoch: {epoch_loss}")
+    print(f"Training Accuracy Epoch: {epoch_accu}")
+
+    return 
+
 
 #train engine
 for epoch in range(1):
-    train(epoch)
+    if FROM_BERT_LAYER_OUT:
+        train_decode(epoch)
+    else:
+        train(epoch)
+
 
 #detokenize/validation def
 def DBDetokenize(a):
@@ -273,10 +407,49 @@ def valid(model, testing_loader):
     
     return epoch_accu
 
+def valid_decode(model, testing_loader):
+    tr_loss = 0 #added
+    nb_tr_steps = 0 #added
+    nb_tr_examples = 0 #added
+    max_wrong_outputs = 10
+    wrong_outputs = 0
+    model.eval()
+    n_correct = 0; n_wrong = 0; total = 0
+    with torch.no_grad():
+        for _, data in enumerate(testing_loader, 0):
+            inputs = data['inputs'].to(device, dtype = torch.long)
+            targets = data['targets'].to(device, dtype = torch.long)
+            outputs = model(inputs)#.squeeze()
+            loss = loss_function(outputs, targets)
+            tr_loss += loss.item()
+            big_val, big_idx = torch.max(outputs.data, dim=1)
+            n_correct += calcuate_accu(big_idx, targets)
 
-#validation run
-acc = valid(model, testing_loader)
-print("Accuracy on test data = %0.2f%%" % acc)
+            
+            nb_tr_steps += 1
+            nb_tr_examples+=targets.size(0)
+            
+            if _%5000==0:
+                loss_step = tr_loss/nb_tr_steps
+                accu_step = (n_correct*100)/nb_tr_examples
+                print(f"Validation Loss per 100 steps: {loss_step}")
+                print(f"Validation Accuracy per 100 steps: {accu_step}")
+    epoch_loss = tr_loss/nb_tr_steps
+    epoch_accu = (n_correct*100)/nb_tr_examples
+    print(f"Validation Loss Epoch: {epoch_loss}")
+    print(f"Validation Accuracy Epoch: {epoch_accu}")
+    
+    return epoch_accu
+
+if FROM_BERT_LAYER_OUT:
+    #validation run
+    acc = valid_decode(model, testing_loader)
+    print("Accuracy on test data = %0.2f%%" % acc)
+else:
+    #validation run
+    acc = valid(model, testing_loader)
+    print("Accuracy on test data = %0.2f%%" % acc)
+
 
 model_to_save = model
 torch.save(model_to_save, OUTPUT_MODEL_PATH)
